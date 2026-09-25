@@ -105,6 +105,7 @@ def execute(
     verbose=False,
     dryrun=False,
     randomorder=False,
+    descorder=False,
     prefix=None,
     max_jobs=None,
     wait_interval=None,
@@ -145,6 +146,8 @@ def execute(
                         id_clause = f" AND Seq IN ({ids})"
                     if randomorder:
                         sql = f"SELECT Seq, Command FROM parjob WHERE Exitval is NULL{id_clause} ORDER BY RANDOM() LIMIT 1;"
+                    elif descorder:
+                        sql = f"SELECT Seq, Command FROM parjob WHERE Exitval is NULL{id_clause} ORDER BY Seq DESC LIMIT 1;"
                     else:
                         sql = f"SELECT Seq, Command FROM parjob WHERE Exitval is NULL{id_clause} LIMIT 1;"
                     cur.execute(sql)
@@ -159,7 +162,7 @@ def execute(
                         cmd,
                     ) = row
                     cur.execute(
-                        f"UPDATE parjob SET Starttime = unixepoch('now'), Exitval = -1000 WHERE Seq = {taskid};"
+                        f"UPDATE parjob SET Starttime = CAST(strftime('%s','now') AS INTEGER), Exitval = -1000 WHERE Seq = {taskid};"
                     )
                     log(f"{slot[workerid]}: taskid, cmd:", taskid, cmd)
                     assert cur.rowcount == 1
@@ -168,7 +171,11 @@ def execute(
                     break
                 except Exception as e:
                     log(f"{slot[workerid]}: Exception:", e)
-                    pass
+                    if con.in_transaction:
+                        con.rollback()
+                    if not is_sqlite_lock_error(e):
+                        raise
+                    time.sleep(db_retry_delay)
 
         if nomorejob:
             if wait_interval is not None and wait_interval > 0:
@@ -694,7 +701,7 @@ def diagnosedb(args):
         con2 = sqlite3.connect(dbfile, timeout=2)
         cur = con2.cursor()
         cur.execute(
-            "SELECT Seq, CAST(unixepoch('now') - Starttime AS INTEGER) as age_sec, "
+            "SELECT Seq, CAST(CAST(strftime('%s','now') AS INTEGER) - Starttime AS INTEGER) as age_sec, "
             "Hostname, PID, Command "
             "FROM parjob WHERE Exitval = -1000 ORDER BY age_sec DESC;"
         )
@@ -889,6 +896,7 @@ def exec(args):
                 verbose=args.verbose,
                 dryrun=args.dryrun,
                 randomorder=args.randomorder,
+                descorder=args.descorder,
                 prefix=args.prefix,
                 max_jobs=args.max_jobs,
                 wait_interval=args.wait,
@@ -1048,7 +1056,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--timeskip", type=float, metavar="SECONDS", help="timeskip", default=0.0
     )
-    parser.add_argument("--randomorder", action="store_true", help="randomorder")
+    order_group = parser.add_mutually_exclusive_group()
+    order_group.add_argument(
+        "--randomorder", action="store_true", help="process jobs in random order"
+    )
+    order_group.add_argument(
+        "--descorder",
+        action="store_true",
+        help="process jobs in descending Seq order",
+    )
     parser.add_argument("--prefix", metavar="CMD", help="command prefix")
     parser.add_argument(
         "--max_jobs",
@@ -1153,7 +1169,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--timeskip", type=float, metavar="SECONDS", help="timeskip", default=0.0
     )
-    parser.add_argument("--randomorder", action="store_true", help="randomorder")
+    order_group = parser.add_mutually_exclusive_group()
+    order_group.add_argument(
+        "--randomorder", action="store_true", help="process jobs in random order"
+    )
+    order_group.add_argument(
+        "--descorder",
+        action="store_true",
+        help="process jobs in descending Seq order",
+    )
     parser.add_argument("--prefix", metavar="CMD", help="command prefix")
     parser.add_argument(
         "--max_jobs",
@@ -1275,13 +1299,39 @@ if __name__ == "__main__":
         and len(cmds) == 1
         and not sys.stdin.isatty()
     ):
-        stdin_args = [
+        stdin_lines = [
             line.rstrip()
             for line in sys.stdin
             if not line.startswith("#") and line.strip() != ""
         ]
-        if stdin_args:
-            cmds.append(stdin_args)
+        if stdin_lines:
+            # Detect how many positional fields the command references
+            cmd_str = " ".join(getattr(args, "cmd", []))
+            max_field = -1
+            for _, field_name, _, _ in Formatter().parse(cmd_str):
+                if field_name is not None:
+                    try:
+                        idx = int(field_name)
+                        if idx > max_field:
+                            max_field = idx
+                    except (ValueError, TypeError):
+                        pass
+            num_fields = max_field + 1 if max_field >= 0 else 1
+
+            if num_fields > 1:
+                # Split each line into fields; pivot rows->columns into separate arg groups
+                # and implicitly apply --zip semantics
+                columns = [[] for _ in range(num_fields)]
+                for line in stdin_lines:
+                    parts = line.split(None, num_fields - 1)
+                    for col_idx in range(num_fields):
+                        columns[col_idx].append(parts[col_idx] if col_idx < len(parts) else "")
+                for col in columns:
+                    cmds.append(col)
+                if not args.zip:
+                    args.zip = True
+            else:
+                cmds.append(stdin_lines)
 
     args.cmds = cmds
 
