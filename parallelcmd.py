@@ -589,18 +589,35 @@ def resetdb(args):
                 args.id = [args.id]
             filter = "Seq IN (%s)" % ",".join(map(str, args.id))
 
+        exitval = getattr(args, "exitval", None)
+        if exitval is not None:
+            # never overwrite in-progress jobs; the worker would clobber it anyway
+            filter = f"({filter}) AND (Exitval IS NULL OR Exitval <> -1000)"
+
         cur = con.cursor()
         rows, row_format = selectdb(cur, filter)
         # (count,) = cur.fetchone()
         count = len(rows)
+        if exitval is not None:
+            action = "marked with Exitval = %d" % exitval
+        else:
+            action = "reset"
         if not getattr(args, "yes", False):
-            ans = input("%d number of rows will be reset. Continue? (Y/N): " % count)
+            ans = input("%d number of rows will be %s. Continue? (Y/N): " % (count, action))
         if getattr(args, "yes", False) or ans == "Y" or ans == "y":
-            cur = execute_sql_with_retry(
-                con,
-                f"UPDATE parjob SET Starttime = NULL, Hostname = NULL, PID = NULL, JobRuntime = NULL, Exitval = NULL WHERE {filter};",
-            )
-            info("Reset: %d" % cur.rowcount)
+            if exitval is not None:
+                cur = execute_sql_with_retry(
+                    con,
+                    f"UPDATE parjob SET Exitval = ? WHERE {filter};",
+                    (exitval,),
+                )
+                info("Marked: %d" % cur.rowcount)
+            else:
+                cur = execute_sql_with_retry(
+                    con,
+                    f"UPDATE parjob SET Starttime = NULL, Hostname = NULL, PID = NULL, JobRuntime = NULL, Exitval = NULL WHERE {filter};",
+                )
+                info("Reset: %d" % cur.rowcount)
             con.commit()
         else:
             print("Aborted.")
@@ -999,6 +1016,21 @@ if __name__ == "__main__":
         "--nonzero", action="store_true", help="reset only nonzero return tasks"
     )
     parser.add_argument("--id", type=int, metavar="ID", help="reset by id", nargs="+")
+    mark_group = parser.add_mutually_exclusive_group()
+    mark_group.add_argument(
+        "--done",
+        action="store_const",
+        const=0,
+        dest="exitval",
+        help="mark selected tasks as done (Exitval = 0) instead of resetting; skips running tasks",
+    )
+    mark_group.add_argument(
+        "--exitval",
+        type=int,
+        metavar="N",
+        dest="exitval",
+        help="mark selected tasks with Exitval = N instead of resetting; skips running tasks",
+    )
     parser.add_argument(
         "-y", "--yes", action="store_true", help="skip confirmation prompt"
     )
