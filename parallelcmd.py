@@ -25,6 +25,8 @@ import datetime
 mq = queue.Queue()
 slot = dict()
 active_ps = dict()
+active_tasks = dict()  # taskid -> Popen, for tasks running in this process
+kill_requested = dict()  # taskid -> (signum, requeue), set by kill_watcher
 active = mp.Value("i", 0)
 fail_count = mp.Value("i", 0)
 halt_flag = mp.Value("b", 0)
@@ -33,6 +35,34 @@ dbname = "pardb" if os.getenv("PARDB") is None else os.getenv("PARDB")
 dbfile = dbname + ".sqlite"
 db_retries = 10
 db_retry_delay = 0.2
+
+## Exitval encoding for in-progress jobs:
+##   -1000            running
+##   -1000 - signum   running, kill requested (record -signum when killed)
+##   -1100 - signum   running, kill requested (requeue when killed)
+RUNNING = -1000
+KILLREQ = -1000
+KILLREQ_REQUEUE = -1100
+IN_PROGRESS_SQL = "Exitval BETWEEN -1164 AND -1000"
+KILLREQ_SQL = "Exitval BETWEEN -1164 AND -1001"
+
+
+def decode_killreq(exitval):
+    """Return (signum, requeue) for a kill-request Exitval, else None."""
+    if exitval is None:
+        return None
+    if KILLREQ_REQUEUE - 64 <= exitval <= KILLREQ_REQUEUE - 1:
+        return (KILLREQ_REQUEUE - exitval, True)
+    if KILLREQ - 64 <= exitval <= KILLREQ - 1:
+        return (KILLREQ - exitval, False)
+    return None
+
+
+def signame(signum):
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return str(signum)
 
 
 def log(*args, sep=" "):
@@ -251,15 +281,15 @@ def execute(
                 )
                 with active.get_lock():
                     active_ps[workerid] = p
+                    active_tasks[taskid] = p
 
-                if attempt == 0:
-                    with sqlite3.connect(dbfile) as con:
-                        execute_sql_with_retry(
-                            con,
-                            "UPDATE parjob SET Hostname = ?, PID = ? WHERE Seq = ?;",
-                            (hostname, p.pid, taskid),
-                        )
-                        con.commit()
+                with sqlite3.connect(dbfile) as con:
+                    execute_sql_with_retry(
+                        con,
+                        "UPDATE parjob SET Hostname = ?, PID = ? WHERE Seq = ?;",
+                        (hostname, p.pid, taskid),
+                    )
+                    con.commit()
 
                 def _kill_on_timeout():
                     nonlocal timed_out
@@ -298,9 +328,18 @@ def execute(
                 with active.get_lock():
                     active.value -= 1
                     del active_ps[workerid]
+                    active_tasks.pop(taskid, None)
+                    killed = kill_requested.pop(taskid, None)
 
                 exitval = 124 if timed_out else p.returncode
 
+                if killed is not None:
+                    exitval = -killed[0]
+                    info(
+                        "%d: Killed by request (%s)%s."
+                        % (taskid, signame(killed[0]), ", requeued" if killed[1] else "")
+                    )
+                    break
                 if timed_out:
                     info("%d: Timeout after %ss. Killed." % (taskid, timeout))
                     break
@@ -316,13 +355,21 @@ def execute(
             runtime = time.time() - starttime
 
             with sqlite3.connect(dbfile) as con:
-                execute_sql_with_retry(
-                    con,
-                    f"UPDATE parjob SET Exitval = {exitval}, JobRuntime = {runtime} WHERE Seq = {taskid};",
-                )
+                if killed is not None and killed[1]:
+                    execute_sql_with_retry(
+                        con,
+                        "UPDATE parjob SET Starttime = NULL, Hostname = NULL, PID = NULL, JobRuntime = NULL, Exitval = NULL WHERE Seq = ?;",
+                        (taskid,),
+                    )
+                else:
+                    execute_sql_with_retry(
+                        con,
+                        "UPDATE parjob SET Exitval = ?, JobRuntime = ? WHERE Seq = ?;",
+                        (exitval, runtime, taskid),
+                    )
                 con.commit()
 
-            if halt is not None and exitval != 0:
+            if halt is not None and exitval != 0 and killed is None:
                 with fail_count.get_lock():
                     fail_count.value += 1
                     if fail_count.value >= halt:
@@ -349,6 +396,37 @@ def execute(
             if max_jobs is not None and finished >= max_jobs:
                 break
     return 0
+
+
+def kill_watcher(stop, interval):
+    """Poll the DB for kill requests on tasks running in this process."""
+    hostname = socket.gethostname()
+    while not stop.wait(interval):
+        try:
+            con = sqlite3.connect(dbfile, timeout=interval)
+            try:
+                rows = con.execute(
+                    f"SELECT Seq, Exitval FROM parjob WHERE {KILLREQ_SQL} AND Hostname = ?;",
+                    (hostname,),
+                ).fetchall()
+            finally:
+                con.close()
+        except Exception as e:
+            log("kill_watcher Exception:", e)
+            continue
+
+        for taskid, exitval in rows:
+            req = decode_killreq(exitval)
+            with active.get_lock():
+                p = active_tasks.get(taskid)
+                if p is None or kill_requested.get(taskid) == req:
+                    continue
+                kill_requested[taskid] = req
+            info("%d: Kill requested. Sending %s." % (taskid, signame(req[0])))
+            try:
+                os.killpg(p.pid, req[0])
+            except ProcessLookupError:
+                pass
 
 
 def jobcount():
@@ -546,7 +624,7 @@ def checkdb(args):
             )
 
         if args.running:
-            filter = "Exitval = -1000"
+            filter = IN_PROGRESS_SQL
 
         # con.row_factory = sqlite3.Row
         cur = con.cursor()
@@ -558,13 +636,14 @@ def checkdb(args):
                 "SELECT count(1) as Total, "
                 "sum(case when Exitval IS NULL then 1 else 0 end) as Pending, "
                 "sum(case when Exitval == -1000 then 1 else 0 end) as Running, "
+                f"sum(case when {KILLREQ_SQL} then 1 else 0 end) as Killing, "
                 "sum(case when Exitval == 0 then 1 else 0 end) as Success, "
                 "sum(case when Exitval > 0 then 1 else 0 end) as Failed, "
-                "sum(case when Exitval < 0 and Exitval != -1000 then 1 else 0 end) as Error "
+                f"sum(case when Exitval < 0 and NOT ({IN_PROGRESS_SQL}) then 1 else 0 end) as Error "
                 "FROM parjob;"
             )
             row = cur.fetchone()
-            row_format = " {:>5} | {:>7} {:>7} | {:>7} {:>6} {:>5}"
+            row_format = " {:>5} | {:>7} {:>7} {:>7} | {:>7} {:>6} {:>5}"
             print_table(cur, [row], row_format)
 
 
@@ -592,7 +671,7 @@ def resetdb(args):
         exitval = getattr(args, "exitval", None)
         if exitval is not None:
             # never overwrite in-progress jobs; the worker would clobber it anyway
-            filter = f"({filter}) AND (Exitval IS NULL OR Exitval <> -1000)"
+            filter = f"({filter}) AND (Exitval IS NULL OR NOT ({IN_PROGRESS_SQL}))"
 
         cur = con.cursor()
         rows, row_format = selectdb(cur, filter)
@@ -700,42 +779,49 @@ def diagnosedb(args):
             "SELECT count(1) as Total, "
             "sum(case when Exitval IS NULL then 1 else 0 end) as Pending, "
             "sum(case when Exitval == -1000 then 1 else 0 end) as Running, "
+            f"sum(case when {KILLREQ_SQL} then 1 else 0 end) as Killing, "
             "sum(case when Exitval == 0 then 1 else 0 end) as Success, "
             "sum(case when Exitval > 0 then 1 else 0 end) as Failed, "
-            "sum(case when Exitval < 0 and Exitval != -1000 then 1 else 0 end) as Error "
+            f"sum(case when Exitval < 0 and NOT ({IN_PROGRESS_SQL}) then 1 else 0 end) as Error "
             "FROM parjob;"
         )
         row = cur.fetchone()
         con1.close()
-        row_format = " {:>5} | {:>7} {:>7} | {:>7} {:>6} {:>5}"
+        row_format = " {:>5} | {:>7} {:>7} {:>7} | {:>7} {:>6} {:>5}"
         print_table(cur, [row], row_format)
     except sqlite3.OperationalError as e:
         print(f"  Could not query job counts: {e}")
 
     # 2. In-progress jobs with age
-    print("\n=== In-Progress Jobs (Exitval = -1000) ===")
+    print("\n=== In-Progress Jobs (Exitval -1000, or kill requested) ===")
     try:
         con2 = sqlite3.connect(dbfile, timeout=2)
         cur = con2.cursor()
         cur.execute(
             "SELECT Seq, CAST(CAST(strftime('%s','now') AS INTEGER) - Starttime AS INTEGER) as age_sec, "
-            "Hostname, PID, Command "
-            "FROM parjob WHERE Exitval = -1000 ORDER BY age_sec DESC;"
+            "Hostname, PID, Exitval, Command "
+            f"FROM parjob WHERE {IN_PROGRESS_SQL} ORDER BY age_sec DESC;"
         )
         rows = cur.fetchall()
         con2.close()
         if not rows:
             print("  None.")
         else:
-            row_format = " {:>4} {:>10} {:<22} {:>8} {:<60}"
+            row_format = " {:>4} {:>10} {:<22} {:>8} {:>7} {:<60}"
             print_table(cur, rows, row_format)
+            killing = [r for r in rows if r[4] != RUNNING]
+            if killing:
+                print(
+                    f"\n  NOTE: {len(killing)} job(s) have a pending kill request (Exitval < -1000);"
+                    " the owning exec has not acted on it yet (or is gone)."
+                )
             stale = [r for r in rows if r[1] is not None and r[1] > stale_threshold]
             if stale:
                 print(
                     f"\n  WARNING: {len(stale)} job(s) running > {stale_threshold}s — possibly stale (worker died)."
                 )
                 print(
-                    f'  Reset with: parallelcmd.py reset --where "Exitval = -1000" -y'
+                    f'  Reset with: parallelcmd.py reset --where "{IN_PROGRESS_SQL}" -y'
                 )
     except sqlite3.OperationalError as e:
         print(f"  Could not query in-progress jobs: {e}")
@@ -785,6 +871,135 @@ def diagnosedb(args):
             print("  No other processes have the DB files open.")
     except FileNotFoundError:
         print("  lsof not found on this system.")
+
+
+def parse_signal(value):
+    v = value.upper()
+    if v.isdigit():
+        return int(v)
+    if not v.startswith("SIG"):
+        v = "SIG" + v
+    try:
+        return int(signal.Signals[v])
+    except KeyError:
+        raise argparse.ArgumentTypeError("unknown signal: %s" % value)
+
+
+def local_job_alive(pid, starttime):
+    """True if pid is still the job's process group leader (guards against PID reuse)."""
+    try:
+        if os.getpgid(pid) != pid:
+            return False
+        with open(f"/proc/{pid}/stat") as f:
+            ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/stat") as f:
+            btime = next(int(l.split()[1]) for l in f if l.startswith("btime"))
+        proc_start = btime + ticks / os.sysconf("SC_CLK_TCK")
+        ## the job is launched right after its Starttime is written
+        return starttime is None or proc_start >= starttime - 2
+    except (ProcessLookupError, FileNotFoundError, PermissionError, StopIteration):
+        return False
+
+
+def killdb(args):
+    clauses = []
+    if args.id:
+        clauses.append("Seq IN (%s)" % ",".join(map(str, args.id)))
+    if args.where is not None:
+        clauses.append(f"({args.where})")
+    if args.like is not None:
+        clauses.append("Command LIKE '%s'" % args.like.replace("'", "''"))
+    if args.host is not None:
+        clauses.append("Hostname = '%s'" % args.host.replace("'", "''"))
+    if not clauses and not args.all:
+        raise SystemExit("kill: select jobs with --id, --where, --like, --host or --all")
+    clauses.append(IN_PROGRESS_SQL)
+    filter = " AND ".join(clauses)
+
+    signum = args.signal
+    code = (KILLREQ_REQUEUE if args.reset else KILLREQ) - signum
+    final = None if args.reset else -signum
+
+    with sqlite3.connect(dbfile) as con:
+        cur = con.cursor()
+        rows, _ = selectdb(cur, filter)
+        if not rows:
+            print("No running jobs match.")
+            return
+        if not getattr(args, "yes", False):
+            ans = input(
+                "%d running job(s) will be sent %s%s. Continue? (Y/N): "
+                % (len(rows), signame(signum), " and requeued" if args.reset else "")
+            )
+            if ans not in ("Y", "y"):
+                print("Aborted.")
+                return
+        seqs = [r[0] for r in rows]
+        seq_list = ",".join(map(str, seqs))
+        cur = execute_sql_with_retry(
+            con,
+            f"UPDATE parjob SET Exitval = ? WHERE Seq IN ({seq_list}) AND {IN_PROGRESS_SQL};",
+            (code,),
+        )
+        con.commit()
+        info("Kill requested: %d" % cur.rowcount)
+
+    if args.wait <= 0:
+        return
+
+    ## wait for the owning exec processes to act on the request
+    deadline = time.time() + args.wait
+    while True:
+        with sqlite3.connect(dbfile) as con:
+            pending = con.execute(
+                f"SELECT Seq, Hostname, PID, Starttime FROM parjob WHERE Seq IN ({seq_list}) AND Exitval = ?;",
+                (code,),
+            ).fetchall()
+        if not pending or time.time() >= deadline:
+            break
+        time.sleep(0.5)
+
+    ## no ack: the owning exec is gone (or slow). Handle local orphans directly.
+    hostname = socket.gethostname()
+    remote = []
+    for seq, host, pid, starttime in pending:
+        if host != hostname or pid is None:
+            remote.append((seq, host, pid))
+            continue
+        if local_job_alive(pid, starttime):
+            try:
+                os.killpg(pid, signum)
+                note = "orphan, sent %s to process group %d" % (signame(signum), pid)
+            except ProcessLookupError:
+                note = "orphan, process already gone"
+        else:
+            note = "orphan, process already gone"
+        with sqlite3.connect(dbfile) as con:
+            if final is None:
+                sql = "UPDATE parjob SET Starttime = NULL, Hostname = NULL, PID = NULL, JobRuntime = NULL, Exitval = NULL WHERE Seq = ? AND Exitval = ?;"
+                params = (seq, code)
+            else:
+                sql = "UPDATE parjob SET Exitval = ?, JobRuntime = CAST(strftime('%s','now') AS INTEGER) - Starttime WHERE Seq = ? AND Exitval = ?;"
+                params = (final, seq, code)
+            execute_sql_with_retry(con, sql, params)
+            con.commit()
+        print("  %d: %s; marked %s" % (seq, note, "pending" if final is None else final))
+
+    acked = len(seqs) - len(pending)
+    info("Killed by owning exec: %d" % acked)
+    if remote:
+        print(
+            "\n  %d job(s) not acknowledged within %ss. Their exec may be dead;"
+            " the request stays pending in case it is only slow." % (len(remote), args.wait)
+        )
+        for seq, host, pid in remote:
+            print(
+                "  %d: on %s  ->  ssh %s kill -%s -- -%s" % (seq, host, host, signame(signum)[3:], pid)
+            )
+        print(
+            '  Then clear them with: parallelcmd.py reset --where "%s" -y'
+            % KILLREQ_SQL
+        )
 
 
 def initdb(args):
@@ -905,6 +1120,12 @@ def exec(args):
         max_workers=args.nworkers, initializer=hello, initargs=(counter,)
     )
 
+    watcher_stop = threading.Event()
+    if not args.dryrun and args.kill_poll > 0:
+        Thread(
+            target=kill_watcher, args=(watcher_stop, args.kill_poll), daemon=True
+        ).start()
+
     with pool as executor:
         future_list = list()
         for index in range(args.nworkers):
@@ -931,6 +1152,7 @@ def exec(args):
         for future in future_list:
             future.result()
 
+        watcher_stop.set()
         mq.put((None, None, None))
         p.join()
 
@@ -1056,7 +1278,7 @@ if __name__ == "__main__":
         "-f", "--force", action="store_true", help="overwrite existing table"
     )
     parser.add_argument(
-        "--check_dup", action="store_true", help="allow duplicate commands"
+        "--check_dup", action="store_true", help="skip commands that already exist in the DB"
     )
     parser.add_argument(
         "--zip",
@@ -1082,11 +1304,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bar", action="store_true", help="show a visual ASCII progress bar"
     )
-    parser.add_argument("--dashboard", action="store_true", help="print only last line")
+    parser.add_argument("--dashboard", action="store_true", help="one live line per worker, redrawn in place")
     parser.add_argument("--dryrun", action="store_true", help="dryrun")
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose")
     parser.add_argument(
-        "--timeskip", type=float, metavar="SECONDS", help="timeskip", default=0.0
+        "--timeskip", type=float, metavar="SECONDS", help="print at most one output line per SECONDS; others are discarded", default=0.0
     )
     order_group = parser.add_mutually_exclusive_group()
     order_group.add_argument(
@@ -1102,7 +1324,7 @@ if __name__ == "__main__":
         "--max_jobs",
         type=int,
         metavar="N",
-        help="maximum number of jobs per process to run",
+        help="maximum number of jobs per worker to run",
     )
 
     parser.add_argument(
@@ -1111,6 +1333,13 @@ if __name__ == "__main__":
         default=None,
         metavar="SECONDS",
         help="wait SECONDS and retry when no job is available (default: exit immediately)",
+    )
+    parser.add_argument(
+        "--kill-poll",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="how often to check the DB for kill requests (default: 2; 0 disables)",
     )
     parser.add_argument(
         "--timeout",
@@ -1177,7 +1406,7 @@ if __name__ == "__main__":
         "-f", "--force", action="store_true", help="overwrite existing table"
     )
     parser.add_argument(
-        "--check_dup", action="store_true", help="allow duplicate commands"
+        "--check_dup", action="store_true", help="skip commands that already exist in the DB"
     )
     parser.add_argument(
         "--zip",
@@ -1196,10 +1425,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bar", action="store_true", help="show a visual ASCII progress bar"
     )
-    parser.add_argument("--dashboard", action="store_true", help="print only last line")
+    parser.add_argument("--dashboard", action="store_true", help="one live line per worker, redrawn in place")
     parser.add_argument("--dryrun", action="store_true", help="dryrun")
     parser.add_argument(
-        "--timeskip", type=float, metavar="SECONDS", help="timeskip", default=0.0
+        "--timeskip", type=float, metavar="SECONDS", help="print at most one output line per SECONDS; others are discarded", default=0.0
     )
     order_group = parser.add_mutually_exclusive_group()
     order_group.add_argument(
@@ -1215,7 +1444,7 @@ if __name__ == "__main__":
         "--max_jobs",
         type=int,
         metavar="N",
-        help="maximum number of jobs per process to run",
+        help="maximum number of jobs per worker to run",
     )
 
     parser.add_argument(
@@ -1224,6 +1453,13 @@ if __name__ == "__main__":
         default=None,
         metavar="SECONDS",
         help="wait SECONDS and retry when no job is available (default: exit immediately)",
+    )
+    parser.add_argument(
+        "--kill-poll",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="how often to check the DB for kill requests (default: 2; 0 disables)",
     )
     parser.add_argument(
         "--timeout",
@@ -1286,11 +1522,45 @@ if __name__ == "__main__":
         required=True,
     )
     parser.add_argument("--like", metavar="PATTERN", help="like statement")
-    parser.add_argument("--id", type=int, metavar="ID", help="reset by id", nargs="+")
+    parser.add_argument("--id", type=int, metavar="ID", help="update by id", nargs="+")
     parser.add_argument(
         "-y", "--yes", action="store_true", help="skip confirmation prompt"
     )
     parser.set_defaults(func=updatedb)
+
+    ## subcommand: kill
+    parser = subparsers.add_parser("kill")
+    parser.add_argument("--id", type=int, metavar="ID", help="kill by id", nargs="+")
+    parser.add_argument("--where", metavar="EXPR", help="where statement")
+    parser.add_argument("--like", metavar="PATTERN", help="like statement")
+    parser.add_argument("--host", metavar="HOSTNAME", help="only jobs on this host")
+    parser.add_argument(
+        "-a", "--all", action="store_true", help="kill all running jobs"
+    )
+    parser.add_argument(
+        "-s",
+        "--signal",
+        type=parse_signal,
+        default=int(signal.SIGTERM),
+        metavar="SIG",
+        help="signal name or number (default: TERM)",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="requeue killed jobs (Exitval = NULL) instead of recording -signum",
+    )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help="how long to wait for the owning exec to act (default: 10; 0 = don't wait)",
+    )
+    parser.add_argument(
+        "-y", "--yes", action="store_true", help="skip confirmation prompt"
+    )
+    parser.set_defaults(func=killdb)
 
     ## subcommand: diagnose
     parser = subparsers.add_parser("diagnose")
