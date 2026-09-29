@@ -535,7 +535,7 @@ def progress(
     extra = 1 if (progress or bar) else 0
     t0 = time.time()
     t1 = time.time()
-    t2 = time.time()
+    t2 = 0.0  ## so the first line is always printed with --timeskip
     while True:
         workerid, taskid, line = mq.get()
         if (workerid is None) or (done == total):
@@ -1009,8 +1009,10 @@ def initdb(args):
     cmds = args.cmds
     args_list = cmds[1:]
     cmd = " ".join(args.cmd)
-    ## check if cmd has valid formatter
-    valid = any(a is not None or b is not None for _, a, b, _ in Formatter().parse(cmd))
+    ## check if cmd has an argument placeholder ({%} and {#} are run-time only)
+    valid = any(
+        f is not None and f not in ("%", "#") for _, f, _, _ in Formatter().parse(cmd)
+    )
     if not valid:
         cmd += " {}" * len(args_list)
 

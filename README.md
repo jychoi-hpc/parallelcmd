@@ -93,7 +93,7 @@ python3 parallelcmd.py check
 - `::::` starts an argument list loaded from a file (one value per line; empty lines and `#` comments are ignored).
 - `:::: -` reads the argument list from stdin.
 - Multiple lists are combined with Cartesian product.
-- If the command has no placeholders, one `{}` per argument list is appended automatically (`init "echo" ::: a b ::: x` gives `echo a x`, `echo b x`).
+- If the command has no argument placeholders, one `{}` per argument list is appended automatically (`init "echo" ::: a b ::: x` gives `echo a x`, `echo b x`). `{%}` and `{#}` don't count, so `"echo {%}" ::: a b` gives `echo {%} a`, `echo {%} b`.
 - If no `:::` or `::::` separator is given and stdin is a pipe, stdin lines are used as the argument list automatically. If the command uses `{0}`, `{1}`, …, each line is split on whitespace into that many fields and the fields are paired as with `--zip` (the last field keeps any remaining text).
 
 ### Placeholders
