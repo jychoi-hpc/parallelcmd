@@ -10,7 +10,7 @@ srun -N $SLURM_NNODES -n $SLURM_NNODES python3 parallelcmd.py exec -j 8 --wait 3
 - `Hostname` and `PID` record where each job runs: `check -l --running`.
 - `{%}` is the worker slot *within one exec*, so it is safe for per-node GPU binding.
 - [`kill`](kill.md) works across nodes: it asks the `exec` that owns the job to kill it (`kill --host <node>` targets one node).
-- `--delay` staggers each worker's first job, which helps when many workers start at once.
+- `--delay` staggers each worker's first job, which helps when many workers start at once (it also adds that delay before every job).
 - `--wait` keeps workers polling for jobs appended later with `init -a`.
 
 !!! tip "Lock contention"

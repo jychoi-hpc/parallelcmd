@@ -64,7 +64,7 @@ python3 parallelcmd.py exec -j 4 --timeout 600
 Retry failed jobs only:
 
 ```bash
-python3 parallelcmd.py reset
+python3 parallelcmd.py reset --nonzero
 python3 parallelcmd.py exec -j 4
 ```
 

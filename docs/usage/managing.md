@@ -13,7 +13,7 @@ python3 parallelcmd.py check [options]
 Options:
 
 - `-l, --list` list all matching rows instead of the summary
-- `--nonzero` filter to only jobs with non-zero exit value
+- `--nonzero` filter to only jobs with a positive exit value (failed or timed out)
 - `--running` filter to only currently running jobs
 - `--where <sql>` arbitrary SQL `WHERE` clause
 - `--like <pattern>` filter by `Command LIKE <pattern>`
@@ -57,8 +57,8 @@ These filters are not combined: if more than one is given, `--id` wins over `--a
 Examples:
 
 ```bash
-# rerun everything that failed
-python3 parallelcmd.py reset -y
+# rerun failed and timed-out jobs
+python3 parallelcmd.py reset --nonzero -y
 
 # rerun only timed-out jobs
 python3 parallelcmd.py reset --where "Exitval = 124"
@@ -85,7 +85,7 @@ Options:
 - `--id <id ...>` filter by job ID(s)
 - `-y, --yes` skip confirmation prompt
 
-With no filter, deletes jobs with `Exitval <> 0` (same default as `reset`).
+With no filter, deletes jobs with `Exitval <> 0` (same default as `reset`, so it includes in-progress jobs).
 
 ## `update`
 

@@ -20,7 +20,7 @@
 ### No jobs are executed
 
 - Check queue state: `python3 parallelcmd.py check -l`.
-- If jobs are stuck in-progress (their `exec` died), reset them: `python3 parallelcmd.py reset` (see [`diagnose`](usage/managing.md#diagnose)).
+- If jobs are stuck in-progress (their `exec` died), reset them: `python3 parallelcmd.py reset --where "Exitval BETWEEN -1164 AND -1000" -y` (see [`diagnose`](usage/managing.md#diagnose)).
 - Completed jobs (exit `0`) are never rerun; use `reset --all` to rerun everything.
 
 ### Workers exit before later jobs are appended
