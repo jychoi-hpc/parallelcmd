@@ -1,0 +1,55 @@
+site_name: parallelcmd
+site_description: A persistent, resumable parallel job queue for the shell, backed by SQLite.
+site_url: https://jychoi-hpc.github.io/parallelcmd/
+repo_url: https://github.com/jychoi-hpc/parallelcmd
+repo_name: jychoi-hpc/parallelcmd
+edit_uri: edit/main/docs/
+exclude_docs: |
+  requirements.txt
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.details
+
+nav:
+  - Home: index.md
+  - Installation: install.md
+  - Concepts: concepts.md
+  - Usage:
+      - Running jobs: usage/running.md
+      - Managing the queue: usage/managing.md
+      - Stopping jobs: usage/kill.md
+      - Multiple workers and nodes: usage/multinode.md
+      - Hooks: usage/hooks.md
+  - Examples: examples.md
+  - Troubleshooting: troubleshooting.md
+  - FAQ: faq.md
+  - Comparison with GNU Parallel: comparison.md
